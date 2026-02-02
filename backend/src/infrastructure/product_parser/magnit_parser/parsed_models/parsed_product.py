@@ -1,7 +1,7 @@
-from . import CatalogProduct, NutritionFacts
+from . import CategoryProduct, NutritionFacts
 
 
-class ParsedProduct(CatalogProduct):
+class ParsedProduct(CategoryProduct):
     pass
 
 

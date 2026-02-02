@@ -1,4 +1,3 @@
-from collections import defaultdict
 from functools import cached_property
 import json
 import logging
@@ -6,14 +5,13 @@ from pprint import pprint
 import time
 from typing import List, Annotated, Optional, Dict, Any
 from typing import Protocol
-
-import requests
 # протокол - аналог интерфейса
 
+import requests
 from bs4 import BeautifulSoup
 from pydantic import ValidationError
 
-from .parsed_models import CatalogProduct
+from .parsed_models import CategoryProduct, CatalogCategory
 from ..session_config import session
 
 logging.basicConfig(level=logging.INFO)
@@ -71,20 +69,53 @@ class PageParser(Protocol):
 
 class CatalogParser(PageParser):
     def __init__(self):
-        self.selector = 'a.pl-hover-base'
+        self.selector = (
+                'div.pl-list-item.pl-list-item_primary.pl-list-item_hoverable.pl-list-item_icon_m.header-catalog-item'
+                + ' div.pl-list-item-content'
+                + ' div.pl-list-item-content-left'
+                + ' div.pl-list-item__title'
+                + ' a.header-catalog-item__subitem')
 
-    def parse(self, content: str) -> List[CatalogProduct]:
+    def update_selector(self, selector: Optional[str]):
+        if selector:
+            self.selector = selector
+
+    def parse(self, content: str) -> List[CatalogCategory]:
         if not content:
             return []
 
         soup = BeautifulSoup(content, 'lxml')
 
-        products = []
+        categories: List[CatalogCategory] = []
+        selected = soup.select(self.selector)
+        if not selected:
+            logger.debug("DEBUG: Categories not found in catalog with current selector")
+            return []
+        for category in selected:
+            href = category.get('href', '').strip()
+            title = category.text.strip()
+            if href and title:
+                categories.append(CatalogCategory(title=title, href=href))
+
+        return categories
+
+
+class CategoryParser(PageParser):
+    def __init__(self):
+        self.selector = 'a.pl-hover-base'
+
+    def parse(self, content: str) -> List[CategoryProduct]:
+        if not content:
+            return []
+
+        soup = BeautifulSoup(content, 'lxml')
+
+        products: List[CategoryProduct] = []
         for product in soup.select(self.selector):
             href = product.get('href', '').strip()
             title = product.get('title', '').strip()
             if href and title:
-                products.append(CatalogProduct(title=title, href=href))
+                products.append(CategoryProduct(title=title, href=href))
 
         return products
 
@@ -156,15 +187,29 @@ class CatalogService:
         self.parser = parser
         self.base_url = "https://magnit.ru/catalog"
 
-    def fetch_all_products(self, shop_code: int = 784507,
-                           shop_type: int = 1,
-                           max_pages: int = 10) -> List[CatalogProduct]:
-        all_products = []
-        page = 0
+    def fetch_categories(self, shop_code: int = 784507,
+                         shop_type: int = 1) -> List[CatalogCategory]:
+        params = {
+            'shopType': shop_type,
+            'shopCode': shop_code,
+        }
+        content = self.http.get(self.base_url, params)
+        return self.parser.parse(content)
 
+
+class CategoryService:
+    def __init__(self, http_client: RequestHttpClient, parser: CategoryParser):
+        self.http = http_client
+        self.parser = parser
+
+    def fetch_category_products(self, category: CatalogCategory, shop_code: int = 784507,
+                                shop_type: int = 1,
+                                max_pages: int = 10) -> List[CategoryProduct]:
+        all_products: List[CategoryProduct] = []
+        page = 0
         while page < max_pages:
             params = {'shopCode': shop_code, 'shopType': shop_type, 'page': page}
-            content = self.http.get(url=self.base_url, params=params)
+            content = self.http.get(url=category.url, params=params)
 
             if not content:
                 break
@@ -180,6 +225,24 @@ class CatalogService:
 
         return all_products
 
+    def fetch_multiple_products(self, categories: List[CatalogCategory], shop_code: int = 784507,
+                                shop_type: int = 1,
+                                max_pages: int = 10) -> List[CategoryProduct]:
+        results = []
+
+        for i, category in enumerate(categories, 1):
+            logger.info(f"Processing product {i}/{len(categories)}")
+
+            try:
+                products: List[CategoryProduct] = self.fetch_category_products(category)
+                results.extend(products)
+            except Exception as e:
+                logger.error(f"Error processing {category.title}: {e}")
+
+            time.sleep(0.1)
+
+        return results
+
 
 class ProductService:
     """Сервис для работы с товарами"""
@@ -188,7 +251,7 @@ class ProductService:
         self.http = http_client
         self.parser = parser
 
-    def fetch_product_details(self, product: CatalogProduct) -> Dict[str, Any]:
+    def fetch_product_details(self, product: CategoryProduct) -> Dict[str, Any]:
         content = self.http.get(product.url)
 
         if not content:
@@ -205,7 +268,7 @@ class ProductService:
 
         return details
 
-    def fetch_multiple_products(self, products: List[CatalogProduct]) -> List[Dict[str, Any]]:
+    def fetch_multiple_details(self, products: List[CategoryProduct]) -> List[Dict[str, Any]]:
         results = []
 
         for i, product in enumerate(products, 1):
@@ -234,17 +297,21 @@ class MagnitParser:
         self.http = RequestHttpClient()
         self.product_parser = ProductDetailsParser()
         self.catalog_parser = CatalogParser()
+        self.category_parser = CategoryParser()
 
+        self.category_service = CategoryService(self.http, self.category_parser)
         self.product_service = ProductService(self.http, self.product_parser)
         self.catalog_service = CatalogService(self.http, self.catalog_parser)
 
     @cached_property
-    def catalog_products(self) -> List[CatalogProduct]:
-        return self.catalog_service.fetch_all_products()
+    def catalog_categories(self) -> List[CatalogCategory]:
+        return self.catalog_service.fetch_categories()
 
-    def parse_products(self, products: Optional[List[CatalogProduct]]) -> List[Dict[str, Any]]:
-        products_to_parse = products or self.catalog_products
-        return self.product_service.fetch_multiple_products(products_to_parse)
+    def category_products(self, categories: List[CatalogCategory]) -> List[CategoryProduct]:
+        return self.category_service.fetch_multiple_products(categories)
+
+    def parse_products(self, products: List[CategoryProduct]) -> List[Dict[str, Any]]:
+        return self.product_service.fetch_multiple_details(products)
 
     def clear_cache(self):
         self.http.clear_cache()
@@ -254,8 +321,10 @@ def main():
     # Создаем клиент
     client = MagnitParser()
 
+    categories = client.catalog_categories
+    pprint(categories)
     # Получаем товары из каталога
-    products = client.catalog_products  # Первые 3 товара
+    products = client.category_products(categories)[:5]  # Первые 3 товара
     # Парсим их
     results = client.parse_products(products)
     for result in results:
